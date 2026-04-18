@@ -1,5 +1,6 @@
 // Import required packages.
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;         // Needed for WordProcessingDocument.
 using DocumentFormat.OpenXml.Wordprocessing;    // Needed for all Word schema objects (Body, Paragraph, etc.)
@@ -16,6 +17,13 @@ public sealed class DocxParser
         // 1) [Week 1] Learn DOCX structure and print paragraphs from the document.
         // 2) [Week 2] Build section hierarchy using Word heading styles.
         // 3) [Week 3] Detect tables, lists, and images as structured content nodes.
+        // 4) [Week 4] Add formatting heuristics for files missing heading styles.
+        // 5) [Week 2-4] Create Node instances with:
+        //    - Id: new Guid for each node
+        //    - TemplateId: the templateId argument
+        //    - ParentId: null for root nodes, set for child nodes
+        //    - Type/Title/OrderIndex/MetadataJson based on parsed content
+        // 6) [Week 4] Return ParserResult with Nodes in deterministic order.
 
        
         // Objective: Create a ReadAllParagraphs() method
@@ -39,6 +47,10 @@ public sealed class DocxParser
             9. Detect lists by checking for NumberingProperties in paragraph properties
             10. Classify remaining text content as either "Sentence" or "Paragraph" based on heuristics
             11. Detect tables by checking for Table elements at the body level
+
+            // Week 4:
+            12. Add heuristics to infer headings in documents that don't use Word's built-in heading styles
+
             
         */
             // Result object that will collect all parsed nodes (headings)
@@ -79,13 +91,11 @@ public sealed class DocxParser
                         // 5. Extract and display the actual text.
                         string text = p?.InnerText ?? string.Empty;
 
-                        // Only process headings
-                        if (null != style && style.StartsWith("Heading"))
+                        // Style-based headings
+                        if (!string.IsNullOrEmpty(style) && style.StartsWith("Heading"))
                         {
-                            // Convert "Heading1" -> 1, "Heading2" -> 2, etc.
                             int level = ExtractHeadingLevel(style);
 
-                            // 6. Create a new node representing a heading
                             var node = new Node
                             {
                                 Id = Guid.NewGuid(),
@@ -96,16 +106,43 @@ public sealed class DocxParser
                                 MetadataJson = "{}"
                             };
 
-                            // 7. Fix hierarchy using stack
                             while (stack.Count > 0 && stack.Peek().Level >= level)
                             {
                                 stack.Pop();
                             }
-                            // Assign parent if exists (top of stack is the parent)
+
                             node.ParentId = stack.Count > 0 ? stack.Peek().Node.Id : null;
-                            // Push current node onto stack for future children
+
                             stack.Push((level, node));
-                            // Add node to result list
+                            result.Nodes.Add(node);
+                            continue;
+                        }
+
+                        // Heuristic-based headings
+                        int? inferredLevel = HeuristicHeadingDetector.InferHeadingLevel(p);
+
+                        if (inferredLevel != null)
+                        {
+                            int level = inferredLevel.Value;
+
+                            var node = new Node
+                            {
+                                Id = Guid.NewGuid(),
+                                TemplateId = templateId,
+                                Type = $"Heading{level}", // important for consistency
+                                Title = text,
+                                OrderIndex = orderIndex++,
+                                MetadataJson = "{\"inferred\": true}"
+                            };
+
+                            while (stack.Count > 0 && stack.Peek().Level >= level)
+                            {
+                                stack.Pop();
+                            }
+
+                            node.ParentId = stack.Count > 0 ? stack.Peek().Node.Id : null;
+
+                            stack.Push((level, node));
                             result.Nodes.Add(node);
                             continue;
                         }
@@ -251,13 +288,6 @@ public sealed class DocxParser
             return result;
         }
     }
-        // 4) [Week 4] Add formatting heuristics for files missing heading styles.
-        // 5) [Week 2-4] Create Node instances with:
-        //    - Id: new Guid for each node
-        //    - TemplateId: the templateId argument
-        //    - ParentId: null for root nodes, set for child nodes
-        //    - Type/Title/OrderIndex/MetadataJson based on parsed content
-        // 6) [Week 4] Return ParserResult with Nodes in deterministic order.
         //
         // Helper guidance [Week 3-6]:
         // - YES, create helper classes if this method gets long or hard to read.
@@ -288,12 +318,6 @@ public sealed class DocxParser
             : null;
     }
 
-    private static bool IsListParagraph(Paragraph paragraph)
-    {
-        // NumberingProperties indicates bulleted/numbered list 
-        return paragraph.ParagraphProperties?.NumberingProperties != null;
-    }
-
     private static bool IsSentence(string text)
     {
         // Short text with <= 1 sentence-ending punctuation mark
@@ -304,3 +328,67 @@ public sealed class DocxParser
         return punctuationCount <= 1 && text.Length < 120;
     }
 }
+//12. Add heuristics to infer headings in documents that don't use Word's built-in heading styles
+public static class HeuristicHeadingDetector
+{
+    public static int? InferHeadingLevel(Paragraph p)
+    {
+        string text = p.InnerText?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(text))
+            return null;
+        
+        // Filters (prevent false positives)
+        if (text.Length > 120) return null;
+        if (text.EndsWith(".")) return null;
+        if (text.Count(c => c == '.') > 2) return null;
+
+        // Numbering prefix
+        var match = Regex.Match(text, @"^\(?\d+([.\)]\d+){0,2}\)?");
+        if (match.Success)
+        {
+            int dots = match.Value.Count(c => c == '.');
+            return dots + 1; // 1 -> level 1, 1.1 -> level 2, etc.
+        }
+        int score = 0;
+
+        // Font size
+        score += GetFontSizeScore(p);
+
+        // Bold
+        if (p.Descendants<Bold>().Any())
+            score++;
+
+        // Spacing
+        if (HasSpacing(p))
+            score++;
+
+        // Final decision based on cumulative score
+        if (score >= 4) return 1; // Section
+        if (score >= 3) return 2; // Subsection
+        if (score >= 2) return 3; // Sub-subsection
+
+        return null; // Not a heading        
+    }
+
+        private static bool HasSpacing(Paragraph p)
+        {
+            var spacing = p.ParagraphProperties?.SpacingBetweenLines;
+            return spacing?.Before != null || spacing?.After != null;
+        }
+
+        private static int GetFontSizeScore(Paragraph p)
+        {
+            var run = p.Descendants<Run>().FirstOrDefault();
+            var size = run?.RunProperties?.FontSize?.Val;
+
+            if (size == null) return 0;
+
+            if (int.TryParse(size.Value, out int sz))
+            {
+                if (sz >= 32) return 2;
+                if (sz >= 28) return 1;
+            }
+
+            return 0;
+        }
+    }
